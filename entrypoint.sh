@@ -33,4 +33,4 @@ else
 fi
  
 # Start the garmin-mcp server
-exec garmin-mcp
+exec uv run garmin-mcp
