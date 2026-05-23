@@ -287,9 +287,26 @@ def main():
                         kwargs["host"] = "0.0.0.0"
                     if "port" not in kwargs and port:
                         kwargs["port"] = port
+                    # Wrap the ASGI app to rewrite Host header before MCP sees it
+                    class _HostRewrite:
+                        def __init__(self, inner): self.inner = inner
+                        async def __call__(self, scope, receive, send):
+                            if scope.get("type") == "http":
+                                scope = dict(scope)
+                                scope["headers"] = [
+                                    (b"host", b"localhost") if k.lower() == b"host" else (k, v)
+                                    for k, v in scope.get("headers", [])
+                                ]
+                            return await self.inner(scope, receive, send)
+                    if args:
+                        args = (_HostRewrite(args[0]),) + args[1:]
+                        print("[host-patch] Wrapped app in Config.__init__")
+                    elif "app" in kwargs:
+                        kwargs["app"] = _HostRewrite(kwargs["app"])
+                        print("[host-patch] Wrapped app (kwarg) in Config.__init__")
                     return original_config_init(self, *args, **kwargs)
                 uvicorn.config.Config.__init__ = patched_config_init
-                
+                               
                 # Patch Server.__init__ to force host
                 original_server_init = uvicorn.server.Server.__init__
                 def patched_server_init(self, config, *args, **kwargs):
