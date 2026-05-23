@@ -303,7 +303,7 @@ def main():
             pass
         # Try to run with explicit parameters first
         try:
-            app.run(transport=transport, host=host, port=port, path=path)
+            app.run(transport=transport, host=host, port=port, path=path, allowed_hosts=["*"])
             return
         except TypeError:
             pass
