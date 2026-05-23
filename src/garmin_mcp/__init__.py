@@ -224,18 +224,7 @@ def main():
     if transport == "stdio":
         app.run()
     else:
-        print(f"Starting MCP with transport={transport}, host={host}, port={port}, path={path}")
-        # TEMPORARY DIAGNOSTICS - remove after next deploy
-        try:
-            import mcp.server.streamable_http as _msh
-            import inspect
-            src = inspect.getsource(_msh)
-            print("[DIAG] streamable_http source:")
-            # Print in chunks so Railway doesn't truncate
-            for i in range(0, min(len(src), 4000), 200):
-                print(src[i:i+200])
-        except Exception as e:
-            print(f"[DIAG] failed: {e}")        
+        print(f"Starting MCP with transport={transport}, host={host}, port={port}, path={path}")            
         # Provide simple health endpoints by wrapping the ASGI app when possible
         class _HealthWrapper:
             def __init__(self, inner):
@@ -349,27 +338,26 @@ def main():
         except Exception:
             pass
 
-        # Allow any host header (required for Railway/remote deployments)
+        # Patch TransportSecurityMiddleware to allow Railway's host header
         try:
-            from mcp.server.streamable_http import StreamableHTTPSessionManager as _Mgr
-            _orig_call = _Mgr.__call__
-            async def _allow_any_host(self, scope, receive, send):
-                if scope.get("type") == "http":
-                    headers = [
-                        (b"host", b"localhost") if k == b"host" else (k, v)
-                        for k, v in scope.get("headers", [])
-                    ]
-                    scope = {**scope, "headers": headers}
-                await _orig_call(self, scope, receive, send)
-            _Mgr.__call__ = _allow_any_host
+            import mcp.server.transport_security as _tst
+            import mcp.server.streamable_http as _msh
+
+            class _NoOpSecurityMiddleware:
+                """Replaces TransportSecurityMiddleware for Railway deployment."""
+                def __init__(self, app, settings=None):
+                    self.app = app
+                async def __call__(self, scope, receive, send):
+                    return await self.app(scope, receive, send)
+
+            # Patch in both namespaces — streamable_http already imported it by reference
+            _tst.TransportSecurityMiddleware = _NoOpSecurityMiddleware
+            _msh.TransportSecurityMiddleware = _NoOpSecurityMiddleware
+            print("[host-patch] ✓ TransportSecurityMiddleware replaced with no-op")
         except Exception as e:
-            print(f"Host patch failed: {e}")
-            pass
-        
-        try:
-            app.settings.host = "*"
-        except Exception as e:
-            print(f"Host settings patch failed: {e}")
+            import traceback
+            print(f"[host-patch] ERROR: {e}")
+            traceback.print_exc()
             
         # Try to run with explicit parameters first
         try:
