@@ -93,14 +93,6 @@ def init_api(email, password):
             f"Trying to login to Garmin Connect using token data from directory '{tokenstore}'...\n"
         )
 
-        # Using Oauth1 and Oauth2 tokens from base64 encoded string
-        # print(
-        #     f"Trying to login to Garmin Connect using token data from file '{tokenstore_base64}'...\n"
-        # )
-        # dir_path = os.path.expanduser(tokenstore_base64)
-        # with open(dir_path, "r") as token_file:
-        #     tokenstore = token_file.read()
-
         garmin = Garmin()
         garmin.login(tokenstore)
 
@@ -120,7 +112,7 @@ def init_api(email, password):
             print(
                 f"Oauth tokens stored in '{tokenstore}' directory for future use. (first method)\n"
             )
-            # Encode Oauth1 and Oauth2 tokens to base64 string and safe to file for next login (alternative way)
+            # Encode Oauth1 and Oauth2 tokens to base64 string and save to file for next login
             token_base64 = garmin.garth.dumps()
             dir_path = os.path.expanduser(tokenstore_base64)
             with open(dir_path, "w") as token_file:
@@ -182,36 +174,19 @@ def main():
     app = womens_health.register_tools(app)
     app = recommendations.register_tools(app)
 
-    # Add simple HTTP health and root routes if the underlying ASGI app exposes FastAPI-style router
-    try:
-        asgi = getattr(app, "app", None) or getattr(app, "asgi", None) or getattr(app, "asgi_app", None) or getattr(app, "_app", None)
-        if asgi is not None and hasattr(asgi, "add_api_route"):
-            from typing import Any
-            def _ok() -> Any:
-                return {"status": "ok", "service": "garmin-mcp"}
-            # Health endpoints commonly used by k8s/istio
-            asgi.add_api_route("/healthz", _ok, methods=["GET"])  # type: ignore[attr-defined]
-            asgi.add_api_route("/readyz", _ok, methods=["GET"])  # type: ignore[attr-defined]
-            # Friendly root so GET / doesn't 404
-            asgi.add_api_route("/", _ok, methods=["GET"])  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
     # Add activity listing tool directly to the app
     @app.tool()
     async def list_activities(limit: int = 5) -> str:
         """List recent Garmin activities"""
         try:
             activities = garmin_client.get_activities(0, limit)
-
             if not activities:
                 return "No activities found."
-
             return _to_json_str(activities)
         except Exception as e:
             return f"Error retrieving activities: {str(e)}"
 
-    # Run the MCP server (Streamable HTTP by default for Kubernetes)
+    # Run the MCP server (Streamable HTTP by default for Railway)
     transport = os.environ.get("GARMIN_MCP_TRANSPORT", "http")
     host = os.environ.get("GARMIN_MCP_HOST", "0.0.0.0")
     port_str = os.environ.get("GARMIN_MCP_PORT", "8000")
@@ -223,160 +198,86 @@ def main():
 
     if transport == "stdio":
         app.run()
-    else:
-        print(f"Starting MCP with transport={transport}, host={host}, port={port}, path={path}")            
-        # Provide simple health endpoints by wrapping the ASGI app when possible
-        class _HealthWrapper:
-            def __init__(self, inner):
-                self.inner = inner
-            async def __call__(self, scope, receive, send):
-                if scope.get("type") == "http":
-                    path_value = scope.get("path", "")
-                    if scope.get("method") == "GET" and path_value in ("/", "/healthz", "/readyz"):
-                        body = b'{"status":"ok","service":"garmin-mcp"}'
-                        await send({
-                            "type": "http.response.start",
-                            "status": 200,
-                            "headers": [(b"content-type", b"application/json")],
-                        })
-                        await send({"type": "http.response.body", "body": body})
-                        return
-                    # Rewrite Host header to localhost so MCP's DNS-rebinding
-                    # protection doesn't reject Railway's domain with a 421.
-                    scope = dict(scope)
-                    scope["headers"] = [
-                        (b"host", b"localhost") if k.lower() == b"host" else (k, v)
-                        for k, v in scope.get("headers", [])
-                    ]
-                return await self.inner(scope, receive, send)
-                
-        # Aggressively monkey-patch uvicorn at multiple levels to force 0.0.0.0 binding
-        if host == "0.0.0.0":
-            try:
-                import uvicorn  # type: ignore
-                import uvicorn.config  # type: ignore
-                import uvicorn.server  # type: ignore
-                
-                # Patch uvicorn.run
-                original_run = uvicorn.run
-                def patched_run(app_arg, *args, **kwargs):
-                    if "host" not in kwargs or kwargs.get("host") == "127.0.0.1":
-                        kwargs["host"] = "0.0.0.0"
-                    if "port" not in kwargs and port:
-                        kwargs["port"] = port
-                    # Wrap app to rewrite Host header before MCP sees it
-                    # (fixes 421 from DNS-rebinding protection on Railway)
-                    class _HostRewrite:
-                        def __init__(self, inner): self.inner = inner
-                        async def __call__(self, scope, receive, send):
-                            if scope.get("type") == "http":
-                                scope = dict(scope)
-                                scope["headers"] = [
-                                    (b"host", b"localhost") if k.lower() == b"host" else (k, v)
-                                    for k, v in scope.get("headers", [])
-                                ]
-                            return await self.inner(scope, receive, send)
-                    print("Wrapping app with host-rewrite middleware")
-                    return original_run(_HostRewrite(app_arg), *args, **kwargs)
-                uvicorn.run = patched_run
-                
-                # Patch Config.__init__ to force host
-                original_config_init = uvicorn.config.Config.__init__
-                def patched_config_init(self, *args, **kwargs):
-                    if "host" not in kwargs or kwargs.get("host") == "127.0.0.1" or kwargs.get("host") is None:
-                        kwargs["host"] = "0.0.0.0"
-                    if "port" not in kwargs and port:
-                        kwargs["port"] = port
-                    # Wrap the ASGI app to rewrite Host header before MCP sees it
-                    class _HostRewrite:
-                        def __init__(self, inner): self.inner = inner
-                        async def __call__(self, scope, receive, send):
-                            if scope.get("type") == "http":
-                                scope = dict(scope)
-                                scope["headers"] = [
-                                    (b"host", b"localhost") if k.lower() == b"host" else (k, v)
-                                    for k, v in scope.get("headers", [])
-                                ]
-                            return await self.inner(scope, receive, send)
-                    if args:
-                        args = (_HostRewrite(args[0]),) + args[1:]
-                        print("[host-patch] Wrapped app in Config.__init__")
-                    elif "app" in kwargs:
-                        kwargs["app"] = _HostRewrite(kwargs["app"])
-                        print("[host-patch] Wrapped app (kwarg) in Config.__init__")
-                    return original_config_init(self, *args, **kwargs)
-                uvicorn.config.Config.__init__ = patched_config_init
-                               
-                # Patch Server.__init__ to force host
-                original_server_init = uvicorn.server.Server.__init__
-                def patched_server_init(self, config, *args, **kwargs):
-                    if hasattr(config, 'host') and (config.host == "127.0.0.1" or config.host is None):
-                        config.host = "0.0.0.0"
-                    if hasattr(config, 'port') and not config.port and port:
-                        config.port = port
-                    return original_server_init(self, config, *args, **kwargs)
-                uvicorn.server.Server.__init__ = patched_server_init
-                
-                print("Patched uvicorn at multiple levels to force 0.0.0.0 binding")
-            except Exception as e:
-                print(f"Warning: Could not patch uvicorn: {e}")
+        return
 
-        # Try to locate the underlying ASGI app and run it directly (wrapped) so health endpoints work
+    print(f"Starting MCP with transport={transport}, host={host}, port={port}, path={path}")
+
+    # --- Patch 1: Disable host validation (TransportSecurityMiddleware) ---
+    # The mcp library rejects any Host header that isn't localhost/127.0.0.1,
+    # which breaks Railway deployments. We replace TransportSecurityMiddleware
+    # with a no-op that always allows requests through.
+    try:
+        import mcp.server.transport_security as _tst
+        import mcp.server.streamable_http as _msh
+
+        class _NoOpSecurity:
+            """Pass-through replacement for TransportSecurityMiddleware."""
+            def __init__(self, app=None, settings=None):
+                self.app = app
+
+            async def __call__(self, scope, receive, send):
+                if self.app:
+                    return await self.app(scope, receive, send)
+
+            async def validate_request(self, request, is_post=False):
+                # Return None = request is valid, proceed normally
+                return None
+
+        # Patch the class in both module namespaces.
+        # streamable_http.py does `from mcp.server.transport_security import TransportSecurityMiddleware`
+        # at import time, so we must patch its local reference too.
+        _tst.TransportSecurityMiddleware = _NoOpSecurity
+        _msh.TransportSecurityMiddleware = _NoOpSecurity
+
+        # Also patch streamable_http_manager if it holds a reference
         try:
-            import uvicorn  # type: ignore
-            underlying = getattr(app, "app", None) or getattr(app, "asgi", None) or getattr(app, "asgi_app", None) or getattr(app, "_app", None)
-            if underlying is None:
-                for factory_name in ("build_asgi", "create_asgi", "make_asgi_app"):
-                    factory = getattr(app, factory_name, None)
-                    if callable(factory):
-                        underlying = factory()
-                        break
-            if underlying is not None:
-                wrapped = _HealthWrapper(underlying)
-                uvicorn.run(wrapped, host=host, port=port)
-                return
+            import mcp.server.streamable_http_manager as _shm
+            _shm.TransportSecurityMiddleware = _NoOpSecurity
         except Exception:
             pass
 
-        # Patch TransportSecurityMiddleware to allow Railway's host header
-        try:
-            import mcp.server.transport_security as _tst
-            import mcp.server.streamable_http as _msh
+        print("[patch] TransportSecurityMiddleware replaced — host validation disabled")
+    except Exception as e:
+        import traceback
+        print(f"[patch] TransportSecurityMiddleware patch failed: {e}")
+        traceback.print_exc()
 
-            class _NoOpSecurityMiddleware:
-                """Replaces TransportSecurityMiddleware for Railway deployment."""
-                def __init__(self, app, settings=None):
-                    self.app = app
-                async def __call__(self, scope, receive, send):
-                    return await self.app(scope, receive, send)
+    # --- Patch 2: Force uvicorn to bind on 0.0.0.0 ---
+    # The mcp library calls uvicorn internally and defaults to 127.0.0.1,
+    # which makes the server unreachable on Railway. We patch uvicorn.config.Config
+    # and uvicorn.server.Server so the host is always overridden to 0.0.0.0.
+    try:
+        import uvicorn.config
+        import uvicorn.server
 
-            # Patch in both namespaces — streamable_http already imported it by reference
-            _tst.TransportSecurityMiddleware = _NoOpSecurityMiddleware
-            _msh.TransportSecurityMiddleware = _NoOpSecurityMiddleware
-            print("[host-patch] ✓ TransportSecurityMiddleware replaced with no-op")
-        except Exception as e:
-            import traceback
-            print(f"[host-patch] ERROR: {e}")
-            traceback.print_exc()
-            
-        # Try to run with explicit parameters first
-        try:
-            app.run(transport=transport, host=host, port=port, path=path, allowed_hosts=["*"])
-            return
-        except TypeError:
-            pass
-        try:
-            app.run(transport=transport, hostname=host, port=port, path=path)
-            return
-        except TypeError:
-            pass
-        try:
-            app.run(transport=transport, address=host, port=port, path=path)
-            return
-        except TypeError:
-            pass
-        # Final fallback - the monkey-patch should catch this
-        app.run(transport=transport)
+        _orig_config_init = uvicorn.config.Config.__init__
+        def _patched_config_init(self, *args, **kwargs):
+            if kwargs.get("host") in (None, "127.0.0.1"):
+                kwargs["host"] = "0.0.0.0"
+            if not kwargs.get("port") and port:
+                kwargs["port"] = port
+            return _orig_config_init(self, *args, **kwargs)
+        uvicorn.config.Config.__init__ = _patched_config_init
+
+        _orig_server_init = uvicorn.server.Server.__init__
+        def _patched_server_init(self, config, *args, **kwargs):
+            if hasattr(config, "host") and config.host in (None, "127.0.0.1"):
+                config.host = "0.0.0.0"
+            return _orig_server_init(self, config, *args, **kwargs)
+        uvicorn.server.Server.__init__ = _patched_server_init
+
+        print("[patch] uvicorn patched to bind 0.0.0.0")
+    except Exception as e:
+        print(f"[patch] uvicorn patch failed: {e}")
+
+    # --- Start the server ---
+    try:
+        app.run(transport=transport, host=host, port=port)
+        return
+    except TypeError:
+        pass
+    # Fallback: rely on uvicorn patch above to pick up host/port
+    app.run(transport=transport)
 
 
 if __name__ == "__main__":
