@@ -4,6 +4,8 @@ Modular MCP Server for Garmin Connect Data
 
 import json
 import os
+import threading
+import time
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -39,6 +41,73 @@ from garmin_mcp import nutrition
 from garmin_mcp import courses
 from garmin_mcp import activity_analysis
 from garmin_mcp import workout_templates
+
+
+# --- Optional access logging / alerting for the MCP endpoint ---
+# Logs every HTTP request, and (when ALERT_WEBHOOK_URL is set) pushes an alert
+# for requests whose User-Agent doesn't match ALERT_KNOWN_UA (your own traffic).
+# Observe-only: never blocks or rejects a request; failures are swallowed.
+_ALERT_LAST: dict = {}
+_ALERT_THROTTLE_SEC = 300
+
+
+def _send_webhook(url: str, message: str) -> None:
+    """POST an alert. Body carries content/text/message keys so it works with
+    ntfy, Discord, Slack and most generic webhooks without per-channel code."""
+    try:
+        requests.post(
+            url,
+            json={"content": message, "text": message, "message": message},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[mcp-access] webhook send failed: {e}", flush=True)
+
+
+def _notify_access(request) -> None:
+    """Log an MCP HTTP request and alert if it doesn't look like trusted traffic.
+
+    Called per-request from the security middleware's validate_request(request),
+    so `request` is a Starlette Request.
+    Env vars (all optional; alerting stays off until ALERT_WEBHOOK_URL is set):
+      ALERT_WEBHOOK_URL - POST target for alerts (ntfy / Discord / Slack / etc.)
+      ALERT_KNOWN_UA    - comma-separated, case-insensitive User-Agent substrings
+                          treated as trusted (your own Claude traffic). Requests
+                          matching none of them alert. If unset, every request
+                          alerts (handy once to discover your client's UA, which
+                          is also printed on each [mcp-access] log line).
+    """
+    try:
+        headers = request.headers
+        ua = headers.get("user-agent", "") or ""
+        xff = headers.get("x-forwarded-for") or headers.get("x-real-ip") or ""
+        client = getattr(request, "client", None)
+        ip = xff.split(",")[0].strip() if xff else (client.host if client else "?")
+        method = getattr(request, "method", "")
+        path = request.url.path if getattr(request, "url", None) else ""
+        print(f"[mcp-access] ip={ip} ua={ua!r} {method} {path}", flush=True)
+
+        webhook = os.environ.get("ALERT_WEBHOOK_URL")
+        if not webhook:
+            return
+        known = [
+            s.strip().lower()
+            for s in os.environ.get("ALERT_KNOWN_UA", "").split(",")
+            if s.strip()
+        ]
+        if known and any(s in ua.lower() for s in known):
+            return  # recognized (your own) traffic — stay quiet
+        now = time.time()
+        if now - _ALERT_LAST.get(ip, 0) < _ALERT_THROTTLE_SEC:
+            return  # throttle repeated alerts from the same IP
+        _ALERT_LAST[ip] = now
+        msg = (
+            "[ALERT] Garmin MCP accessed by an unrecognized client\n"
+            f"IP: {ip}\nUser-Agent: {ua or '(none)'}\nRequest: {method} {path}"
+        )
+        threading.Thread(target=_send_webhook, args=(webhook, msg), daemon=True).start()
+    except Exception as e:
+        print(f"[mcp-access] alert hook error: {e}", flush=True)
 
 def get_mfa() -> str:
     """Get MFA code non-interactively for container/Kubernetes environments.
@@ -234,6 +303,7 @@ def main():
                     return await self.app(scope, receive, send)
 
             async def validate_request(self, request, is_post=False):
+                _notify_access(request)
                 # Return None = request is valid, proceed normally
                 return None
 
