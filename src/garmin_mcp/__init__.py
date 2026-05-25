@@ -158,6 +158,46 @@ tokenstore = os.getenv("GARMINTOKENS") or "~/.garminconnect"
 tokenstore_base64 = os.getenv("GARMINTOKENS_BASE64") or "~/.garminconnect_base64"
 
 
+def _install_http_debug(garmin):
+    """Optional outbound-HTTP diagnostics for Garmin API calls.
+
+    When GARMIN_HTTP_DEBUG is truthy, log the status code, body length and key
+    headers of every response garth receives from Garmin. This surfaces the
+    otherwise-invisible empty-body failures (e.g. datacenter-IP blocking) in the
+    Railway logs. Read-only: it only observes responses, never alters them.
+    """
+    if os.environ.get("GARMIN_HTTP_DEBUG", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    try:
+        sess = garmin.garth.sess
+
+        def _log_response(resp, *args, **kwargs):
+            try:
+                h = resp.headers
+                print(
+                    f"[garmin-http] {resp.request.method} {resp.url} "
+                    f"status={resp.status_code} len={len(resp.content or b'')} "
+                    f"ct={h.get('Content-Type', '')} server={h.get('Server', '')} "
+                    f"cf-ray={h.get('CF-Ray', '')} cf-mitigated={h.get('cf-mitigated', '')}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[garmin-http] log error: {e}", flush=True)
+            return None
+
+        sess.hooks.setdefault("response", [])
+        if _log_response not in sess.hooks["response"]:
+            sess.hooks["response"].append(_log_response)
+        print("[garmin-http] outbound HTTP debug logging ENABLED", flush=True)
+    except Exception as e:
+        print(f"[garmin-http] could not install debug hook: {e}", flush=True)
+
+
 def init_api(email, password):
     """Initialize Garmin API with your credentials."""
 
@@ -203,6 +243,7 @@ def init_api(email, password):
             print(err)
             return None
 
+    _install_http_debug(garmin)
     return garmin
 
 
